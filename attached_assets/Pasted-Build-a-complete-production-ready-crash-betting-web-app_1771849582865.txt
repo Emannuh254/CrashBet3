@@ -1,0 +1,212 @@
+Build a complete, production-ready crash betting web application similar in behavior to modern crash games.
+
+⚠️ Do NOT copy proprietary branding, assets, or trademarks.
+Create an original dark-themed design with a red airplane and neon multiplier theme.
+
+====================================================
+TECH STACK
+====================================================
+
+Backend:
+- Node.js
+- Express
+- Socket.io
+- MongoDB (Mongoose)
+- Redis (optional for scaling)
+- JWT authentication
+- Provably fair crash algorithm (SHA256 HMAC)
+- Atomic wallet transactions
+
+Frontend:
+- React (Vite)
+- TailwindCSS
+- Canvas API (for graph rendering)
+- requestAnimationFrame (for 60fps animation loop)
+- Framer Motion (UI transitions)
+- Howler.js (sound effects)
+
+====================================================
+GAME MECHANICS
+====================================================
+
+Round Flow:
+1. 5-second betting window
+2. Round starts at 1.00x
+3. Multiplier grows exponentially:
+   multiplier = e^(growthRate * elapsedTime)
+4. Crash point is pre-generated before round starts using provably fair system
+5. If multiplier >= crashPoint → round crashes instantly
+6. Players must cash out before crash
+7. Auto restart after 3 seconds
+
+Growth rate should be configurable (default 0.15).
+
+====================================================
+PROVABLY FAIR SYSTEM
+====================================================
+
+- Generate serverSeed (hidden)
+- Accept clientSeed
+- Use nonce per round
+- HMAC-SHA256(serverSeed, clientSeed + nonce)
+- Convert first 52 bits to number
+- Crash formula:
+  crash = floor((100 / (1 - result)))/100
+- Minimum crash: 1.00x
+- Reveal serverSeed after round ends
+
+Include verification endpoint.
+
+====================================================
+BACKEND REQUIREMENTS
+====================================================
+
+Create:
+
+- User model:
+  id
+  username
+  hashedPassword
+  balance
+  createdAt
+
+- Bet model:
+  userId
+  roundId
+  amount
+  cashoutMultiplier
+  winAmount
+  status (active, won, lost)
+
+GameEngine class:
+- generateCrashPoint()
+- startBettingPhase()
+- startRound()
+- handleCashout(userId)
+- endRound()
+- broadcast multiplier every 100ms
+- prevent duplicate cashouts
+- lock bets once flying starts
+- server authoritative multiplier only
+
+Socket Events:
+- connect
+- placeBet
+- cashOut
+- multiplierUpdate
+- crash
+- roundStart
+- roundEnd
+- historyUpdate
+
+Security:
+- Validate balance before bet
+- Deduct instantly when bet placed
+- Credit instantly on cashout
+- Use DB transactions
+- Rate limiting
+- Input validation
+- Prevent client-side multiplier tampering
+
+====================================================
+FRONTEND UI SPECIFICATIONS
+====================================================
+
+THEME:
+- Dark gradient background
+- Neon red/pink multiplier text
+- Glowing effects
+- Responsive layout
+- Mobile optimized
+
+MAIN GAME AREA:
+- Large multiplier text centered
+- Animated plane moving along curved path
+- Real-time drawn multiplier graph using Canvas
+- Crash explosion animation
+
+PLANE ANIMATION:
+- Use requestAnimationFrame
+- Position based on multiplier:
+    x = multiplier * 50
+    y = multiplier * 30
+- Apply slight rotation:
+    rotate = min(multiplier * 5deg, 25deg)
+- Stop instantly at crash
+- Add particle trail effect
+- Add screen shake on crash
+
+GRAPH:
+- Canvas-based line chart
+- Clear each frame
+- Redraw path from 1.00x to current multiplier
+- Smooth bezier curve
+- Glowing line effect
+
+SIDEBAR:
+- Live bet feed (real-time)
+- Player name
+- Bet amount
+- Cashout multiplier
+- Win amount
+
+BET PANEL:
+- Bet input
+- Auto cashout input
+- Place bet button
+- Cashout button (turns red when active)
+- Disable inputs during flight
+
+SOUND:
+- Engine sound during flight
+- Explosion sound on crash
+- Cashout sound
+- Toggle mute option
+
+====================================================
+ADMIN FEATURES
+====================================================
+
+- Adjustable house edge %
+- Adjustable growth rate
+- Force crash endpoint (admin only)
+- View live round stats
+- User balance management
+
+====================================================
+SCALABILITY
+====================================================
+
+- Separate game engine from HTTP server
+- Use Redis pub/sub for multi-instance scaling
+- Store round history
+- Optimize for 5,000+ concurrent players
+- Use debounced multiplier broadcasts
+
+====================================================
+DELIVERABLES
+====================================================
+
+Provide:
+- Full backend source code
+- Full frontend source code
+- Folder structure
+- Environment variables example
+- Database schemas
+- Game engine implementation
+- Provably fair verification script
+- Deployment instructions (PM2 + Nginx)
+- Production build instructions
+
+Ensure the app runs locally with:
+
+Backend:
+npm install
+npm run dev
+
+Frontend:
+npm install
+npm run dev
+
+No pseudo code.
+Provide complete working implementation.

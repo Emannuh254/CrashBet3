@@ -1,0 +1,13 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1772288101595,
+      "tag": "0000_watery_hellfire_club",
+      "breakpoints": true
+    }
+  ]
+}

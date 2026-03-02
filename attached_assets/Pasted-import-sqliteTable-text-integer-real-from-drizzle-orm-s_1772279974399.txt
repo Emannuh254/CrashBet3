@@ -1,0 +1,84 @@
+import { sqliteTable, text, integer, real } from "drizzle-orm/sqlite-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod";
+
+/* =======================
+   USERS TABLE
+======================= */
+export const users = sqliteTable("users", {
+  id: integer("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  password: text("password").notNull(),
+  balance: integer("balance").notNull().default(0), // stored as cents
+  isAdmin: integer("is_admin").notNull().default(0),
+  createdAt: text("created_at")
+    .notNull()
+    .default(() => new Date().toISOString()),
+});
+
+/* =======================
+   ROUNDS TABLE
+======================= */
+export const rounds = sqliteTable("rounds", {
+  id: integer("id").primaryKey(),
+  crashPoint: real("crash_point").notNull(),
+  serverSeed: text("server_seed").notNull(),
+  clientSeed: text("client_seed").notNull(),
+  nonce: integer("nonce").notNull(),
+  status: text("status").notNull().default("pending"),
+  startTime: text("start_time"),
+  endTime: text("end_time"),
+});
+
+/* =======================
+   BETS TABLE
+======================= */
+export const bets = sqliteTable("bets", {
+  id: integer("id").primaryKey(),
+  userId: integer("user_id").notNull(),
+  playerIndex: integer("player_index").notNull().default(0),
+  roundId: integer("round_id").notNull(),
+  amount: integer("amount").notNull(), // stored as cents
+  cashoutMultiplier: real("cashout_multiplier"),
+  autoCashout: real("auto_cashout"),
+  winAmount: integer("win_amount"),
+  status: text("status").notNull().default("active"),
+  createdAt: text("created_at")
+    .notNull()
+    .default(() => new Date().toISOString()),
+});
+
+/* =======================
+   ZOD SCHEMAS
+======================= */
+
+// USER
+export const insertUserSchema = createInsertSchema(users).pick({
+  username: true,
+  password: true,
+});
+
+// BET (single source of truth, safe version)
+export const insertBetSchema = z.object({
+  // Convert string input from frontend to number
+  amount: z.coerce.number().min(10, { message: "Minimum bet is 10" }),
+
+  autoCashout: z
+    .union([
+      z.coerce.number().min(1.01, { message: "Minimum autoCashout is 1.01" }),
+      z.null(),
+      z.undefined(),
+    ])
+    .optional(),
+
+  playerIndex: z.coerce.number().min(0).max(4).default(0),
+});
+
+/* =======================
+   TYPES
+======================= */
+export type User = typeof users.$inferSelect;
+export type InsertUser = z.infer<typeof insertUserSchema>;
+export type Round = typeof rounds.$inferSelect;
+export type Bet = typeof bets.$inferSelect;
+export type InsertBet = z.infer<typeof insertBetSchema>;

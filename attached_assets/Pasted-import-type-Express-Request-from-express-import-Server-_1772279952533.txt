@@ -1,0 +1,225 @@
+import type { Express, Request } from "express";
+import { Server } from "http";
+import { storage } from "./storage";
+import { setupAuth } from "./auth";
+import { GameEngine } from "./game";
+import { api, wsEvents } from "@shared/routes";
+import { z } from "zod";
+
+export async function registerRoutes(
+  httpServer: Server,
+  app: Express,
+): Promise<Server> {
+  setupAuth(app);
+  const gameEngine = new GameEngine(httpServer);
+
+  /* ---------------------------------- */
+  /* Utilities                          */
+  /* ---------------------------------- */
+  const toCents = (amount: number) => Math.round(amount * 100);
+  const MIN_BET = 10;
+
+  const moneySchema = z
+    .number()
+    .finite()
+    .positive()
+    .refine((v) => v <= 1_000_000, "Amount too large");
+
+  const adminMoneySchema = z.object({
+    userId: z.number().int().positive(),
+    amount: moneySchema,
+  });
+
+  const adminSetBalanceSchema = z.object({
+    userId: z.number().int().positive(),
+    balance: moneySchema,
+  });
+
+  const isAdmin = (req: Request) =>
+    req.isAuthenticated() && req.user?.isAdmin === 1;
+
+  /* ---------------------------------- */
+  /* Game Routes                        */
+  /* ---------------------------------- */
+  app.get(api.game.state.path, (_req, res) => {
+    return res.json(gameEngine.getStatus());
+  });
+
+  app.get(api.game.history.path, async (_req, res) => {
+    const rounds = await storage.getRecentRounds(20);
+    return res.json(rounds);
+  });
+
+  app.get(api.bets.current.path, async (_req, res) => {
+    const state = gameEngine.getStatus();
+    if (!state.roundId) return res.json([]);
+
+    const bets = await storage.getActiveBets(state.roundId);
+    return res.json(
+      bets.map((b) => ({
+        bet: b,
+        user: b.user,
+        playerIndex: b.playerIndex ?? 0,
+      })),
+    );
+  });
+
+  /* ---------------------------------- */
+  /* Place Bet                          */
+  /* ---------------------------------- */
+  app.post(api.bets.place.path, async (req, res) => {
+    if (!req.isAuthenticated())
+      return res.status(401).json({ message: "Please log in first" });
+
+    try {
+      const input = api.bets.place.input.parse(req.body);
+      const user = await storage.getUser(req.user!.id);
+      if (!user) return res.status(404).json({ message: "User not found" });
+
+      if (input.amount < MIN_BET)
+        return res.status(400).json({ message: `Minimum bet is ${MIN_BET}` });
+
+      if (input.autoCashout && input.autoCashout < 1.01)
+        return res
+          .status(400)
+          .json({ message: "Minimum autoCashout is 1.01x" });
+
+      const amountCents = toCents(input.amount);
+
+      if (user.balance < amountCents)
+        return res.status(400).json({ message: "Insufficient balance" });
+
+      const state = gameEngine.getStatus();
+      const targetRoundId =
+        state.status === "active" || state.status === "crashed"
+          ? (state.roundId ?? 0) + 1
+          : (state.roundId ?? 0);
+
+      // Check slot availability for this specific playerIndex
+      const existingBetsInSlot = await storage.getUserActiveBets(
+        user.id,
+        targetRoundId,
+        input.playerIndex,
+      );
+
+      if (existingBetsInSlot.length > 0)
+        return res.status(400).json({
+          message: `Slot ${input.playerIndex + 1} is already booked`,
+        });
+
+      // Deduct balance & create bet
+      const newBalance = user.balance - amountCents;
+      await storage.updateUserBalance(user.id, newBalance);
+
+      const bet = await storage.createBet({
+        ...input,
+        amount: amountCents,
+        userId: user.id,
+        roundId: targetRoundId,
+      });
+
+      gameEngine.sendToUser(user.id, wsEvents.SERVER_BALANCE_UPDATE, {
+        balance: newBalance,
+      });
+
+      if (targetRoundId === state.roundId) {
+        gameEngine.broadcast(wsEvents.SERVER_BET_PLACED, {
+          bet,
+          user: { id: user.id, username: user.username },
+        });
+      }
+
+      return res.status(201).json(bet);
+    } catch (e) {
+      if (e instanceof z.ZodError)
+        return res.status(400).json({ message: e.errors[0].message });
+
+      console.error("Place bet error:", e);
+      return res.status(500).json({ message: "Something went wrong" });
+    }
+  });
+
+  /* ---------------------------------- */
+  /* Cashout                            */
+  /* ---------------------------------- */
+  app.post(api.bets.cashout.path, async (req, res) => {
+    if (!req.isAuthenticated()) return res.sendStatus(401);
+
+    try {
+      const input = api.bets.cashout.input.parse(req.body);
+      const winAmount = await gameEngine.handleCashout(
+        req.user!.id,
+        undefined,
+        input.playerIndex,
+      );
+
+      return res.json({ message: "Cashed out successfully", winAmount });
+    } catch (e: any) {
+      console.error("Cashout error:", e);
+      return res
+        .status(400)
+        .json({ message: e.message || "Failed to cash out" });
+    }
+  });
+
+  /* ---------------------------------- */
+  /* Admin Routes                       */
+  /* ---------------------------------- */
+  app.get("/api/admin/users", async (req, res) => {
+    if (!isAdmin(req)) return res.sendStatus(403);
+
+    const users = await storage.getAllUsers();
+    return res.json(users.map(({ password, ...u }) => u));
+  });
+
+  app.post("/api/admin/grant-coins", async (req, res) => {
+    if (!isAdmin(req)) return res.sendStatus(403);
+
+    try {
+      const { userId, amount } = adminMoneySchema.parse(req.body);
+      const user = await storage.getUser(userId);
+      if (!user) return res.status(404).json({ message: "User not found" });
+
+      const cents = toCents(amount);
+      const newBalance = user.balance + cents;
+      await storage.updateUserBalance(userId, newBalance);
+
+      gameEngine.sendToUser(userId, wsEvents.SERVER_BALANCE_UPDATE, {
+        balance: newBalance,
+      });
+
+      return res.json({ success: true, balance: newBalance });
+    } catch (e) {
+      if (e instanceof z.ZodError)
+        return res.status(400).json({ message: e.errors[0].message });
+
+      return res.status(500).json({ message: "Failed to grant coins" });
+    }
+  });
+
+  app.post("/api/admin/set-balance", async (req, res) => {
+    if (!isAdmin(req)) return res.sendStatus(403);
+
+    try {
+      const { userId, balance } = adminSetBalanceSchema.parse(req.body);
+      const user = await storage.getUser(userId);
+      if (!user) return res.status(404).json({ message: "User not found" });
+
+      const cents = toCents(balance);
+      await storage.updateUserBalance(userId, cents);
+
+      gameEngine.sendToUser(userId, wsEvents.SERVER_BALANCE_UPDATE, {
+        balance: cents,
+      });
+
+      return res.json({ success: true, balance: cents });
+    } catch (e) {
+      if (e instanceof z.ZodError)
+        return res.status(400).json({ message: e.errors[0].message });
+
+      return res.status(500).json({ message: "Failed to set balance" });
+    }
+  });
+
+  return httpServer;
+}

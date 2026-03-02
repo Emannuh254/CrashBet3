@@ -1,0 +1,291 @@
+import { useState, useEffect, useRef, useMemo } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api, wsEvents } from "@shared/routes";
+import { type Bet, type User } from "@shared/schema";
+import { useToast } from "@/hooks/use-toast";
+import { useAuth } from "./use-auth";
+
+export type GameStatus = "betting" | "active" | "crashed";
+
+export interface GameState {
+  status: GameStatus;
+  multiplier: number;
+  roundId?: number;
+  elapsed: number;
+  crashPoint?: number;
+}
+
+export interface PlayerBet {
+  bet: Bet;
+  user: { id: number; username: string };
+  playerIndex: number;
+}
+
+export function useGame() {
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+  const { user } = useAuth();
+
+  const [gameState, setGameState] = useState<GameState>({
+    status: "betting",
+    multiplier: 1.0,
+    elapsed: 0,
+  });
+
+  const [activeBets, setActiveBets] = useState<PlayerBet[]>([]);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  const MIN_BET = 10; // enforce minimum bet
+
+  // ---------------------------
+  // Fetch game state
+  // ---------------------------
+  useQuery({
+    queryKey: ["gameState"],
+    queryFn: async () => {
+      const res = await fetch(api.game.state.path);
+      if (!res.ok) return null;
+      const data = await res.json();
+      setGameState((prev) => ({ ...prev, ...data }));
+      return data;
+    },
+    refetchOnWindowFocus: false,
+  });
+
+  // ---------------------------
+  // Fetch current bets
+  // ---------------------------
+  useQuery({
+    queryKey: ["currentBets"],
+    queryFn: async () => {
+      const res = await fetch(api.bets.current.path);
+      if (!res.ok) return [];
+      const data = await res.json();
+      setActiveBets(data);
+      return data;
+    },
+    refetchOnWindowFocus: false,
+  });
+
+  // ---------------------------
+  // Fetch game history
+  // ---------------------------
+  const { data: history = [] } = useQuery({
+    queryKey: ["gameHistory"],
+    queryFn: async () => {
+      const res = await fetch(api.game.history.path);
+      if (!res.ok) return [];
+      return await res.json();
+    },
+  });
+
+  // ---------------------------
+  // WebSocket connection
+  // ---------------------------
+  useEffect(() => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | undefined;
+
+    const connect = () => {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const { type, payload } = JSON.parse(event.data);
+
+          switch (type) {
+            case wsEvents.SERVER_STATE_UPDATE:
+              setGameState((prev) => ({ ...prev, ...payload }));
+              break;
+
+            case wsEvents.SERVER_ROUND_START:
+              setGameState({
+                status: "betting",
+                multiplier: 1.0,
+                elapsed: 0,
+                roundId: payload.roundId,
+              });
+              setActiveBets([]);
+              break;
+
+            case wsEvents.SERVER_ROUND_CRASH:
+              setGameState((prev) => ({
+                ...prev,
+                status: "crashed",
+                crashPoint: payload.crashPoint,
+                multiplier: payload.crashPoint,
+              }));
+              queryClient.invalidateQueries(["gameHistory"]);
+              setActiveBets((prev) =>
+                prev.map((pb) =>
+                  pb.bet.status === "active"
+                    ? { ...pb, bet: { ...pb.bet, status: "lost" } }
+                    : pb,
+                ),
+              );
+              break;
+
+            case wsEvents.SERVER_BET_PLACED:
+              setActiveBets((prev) => {
+                if (prev.some((b) => b.bet.id === payload.bet.id)) return prev;
+                return [...prev, payload].sort(
+                  (a, b) => b.bet.amount - a.bet.amount,
+                );
+              });
+              if (user?.id === payload.user.id)
+                queryClient.invalidateQueries([api.auth.me.path]);
+              break;
+
+            case wsEvents.SERVER_BET_CASHED_OUT:
+              setActiveBets((prev) =>
+                prev.map((pb) => (pb.bet.id === payload.bet.id ? payload : pb)),
+              );
+              if (user?.id === payload.user.id)
+                queryClient.invalidateQueries([api.auth.me.path]);
+              break;
+
+            case wsEvents.SERVER_BALANCE_UPDATE:
+              queryClient.setQueryData(
+                [api.auth.me.path],
+                (old: User | undefined) =>
+                  old ? { ...old, balance: payload.balance } : old,
+              );
+              break;
+          }
+        } catch (err) {
+          console.error("WS parse error:", err);
+        }
+      };
+
+      ws.onclose = () => {
+        reconnectTimeout = setTimeout(connect, 3000);
+      };
+    };
+
+    connect();
+
+    return () => {
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      wsRef.current?.close();
+    };
+  }, [queryClient, user]);
+
+  // ---------------------------
+  // Place bet mutation
+  // ---------------------------
+  const placeBetMutation = useMutation({
+    mutationFn: async ({
+      amount,
+      autoCashout,
+      playerIndex,
+    }: {
+      amount: number | string;
+      autoCashout?: number | string | null;
+      playerIndex?: number;
+    }) => {
+      // ----- Clean and validate amount -----
+      let parsedAmount = Number(amount);
+      if (isNaN(parsedAmount)) parsedAmount = MIN_BET;
+
+      // Always floor to integer and enforce minimum
+      parsedAmount = Math.max(MIN_BET, Math.floor(parsedAmount));
+
+      // AutoCashout validation
+      let parsedAuto: number | null = null;
+      if (
+        autoCashout !== undefined &&
+        autoCashout !== null &&
+        autoCashout !== ""
+      ) {
+        const tmp = Number(autoCashout);
+        if (!isNaN(tmp) && tmp >= 1.01) parsedAuto = tmp;
+      }
+
+      const payload = {
+        amount: parsedAmount,
+        autoCashout: parsedAuto,
+        playerIndex: playerIndex ?? 0,
+      };
+
+      const res = await fetch(api.bets.place.path, {
+        method: api.bets.place.method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        credentials: "include",
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.message || "Failed to place bet");
+      }
+
+      return await res.json();
+    },
+    onError: (err: Error) => {
+      toast({
+        title: "Bet Failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    },
+  });
+
+  // ---------------------------
+  // Cashout mutation
+  // ---------------------------
+  const cashoutMutation = useMutation({
+    mutationFn: async (playerIndex: number) => {
+      const res = await fetch(api.bets.cashout.path, {
+        method: api.bets.cashout.method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ playerIndex }),
+        credentials: "include",
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.message || "Failed to cash out");
+      }
+      return await res.json();
+    },
+    onError: (err: Error) => {
+      toast({
+        title: "Cashout Failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    },
+  });
+
+  // ---------------------------
+  // Derived data
+  // ---------------------------
+  const myBets = useMemo(
+    () => (user ? activeBets.filter((pb) => pb.user.id === user.id) : []),
+    [activeBets, user],
+  );
+
+  // Clear old bets on new round
+  useEffect(() => {
+    if (gameState.status === "betting") {
+      setActiveBets((prev) =>
+        prev.filter(
+          (pb) =>
+            pb.bet.status === "active" && pb.bet.roundId === gameState.roundId,
+        ),
+      );
+    }
+  }, [gameState.status, gameState.roundId]);
+
+  return {
+    gameState,
+    activeBets,
+    history,
+    myBets,
+    placeBet: placeBetMutation.mutateAsync,
+    isPlacingBet: placeBetMutation.isPending,
+    cashout: cashoutMutation.mutateAsync,
+    isCashingOut: cashoutMutation.isPending,
+  };
+}

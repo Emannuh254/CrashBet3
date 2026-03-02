@@ -1,0 +1,327 @@
+// BetPanel.tsx
+import React, { useState, useMemo } from "react";
+import { type GameState, type PlayerBet } from "@/hooks/use-game";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { formatMoney } from "@/lib/utils";
+import confetti from "canvas-confetti";
+import { useToast } from "@/hooks/use-toast";
+
+interface BetPanelProps {
+  gameState: GameState;
+  myBets: PlayerBet[];
+  onPlaceBet: (
+    amount: number,
+    autoCashout?: number | null,
+    playerIndex?: number,
+  ) => Promise<any>;
+  onCashout: (playerIndex: number) => Promise<any>;
+  placingSlots: Record<number, boolean>;
+  cashingSlots: Record<number, boolean>;
+  setPlacingSlots: React.Dispatch<
+    React.SetStateAction<Record<number, boolean>>
+  >;
+  setCashingSlots: React.Dispatch<
+    React.SetStateAction<Record<number, boolean>>
+  >;
+  balance: number;
+}
+
+export function BetPanel(props: BetPanelProps) {
+  const { gameState, myBets, placingSlots, cashingSlots } = props;
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4 w-full">
+      {[0, 1, 2, 3, 4].map((index) => (
+        <BetSlot
+          key={index}
+          index={index}
+          gameState={gameState}
+          myBets={myBets.filter((b) => b.playerIndex === index)}
+          placing={placingSlots[index] ?? false}
+          cashing={cashingSlots[index] ?? false}
+          {...props}
+        />
+      ))}
+    </div>
+  );
+}
+
+function BetSlot({
+  index,
+  gameState,
+  myBets,
+  onPlaceBet,
+  onCashout,
+  placing,
+  cashing,
+  setPlacingSlots,
+  setCashingSlots,
+  balance,
+}: {
+  index: number;
+  gameState: GameState;
+  myBets: PlayerBet[];
+  onPlaceBet: (
+    amount: number,
+    autoCashout?: number | null,
+    playerIndex?: number,
+  ) => Promise<any>;
+  onCashout: (playerIndex: number) => Promise<any>;
+  placing: boolean;
+  cashing: boolean;
+  setPlacingSlots: React.Dispatch<
+    React.SetStateAction<Record<number, boolean>>
+  >;
+  setCashingSlots: React.Dispatch<
+    React.SetStateAction<Record<number, boolean>>
+  >;
+  balance: number;
+}) {
+  const { toast } = useToast();
+  const MIN_BET = 10;
+
+  const [amountInput, setAmountInput] = useState<number>(MIN_BET);
+  const [step, setStep] = useState<number>(10);
+  const [autoInput, setAutoInput] = useState<number>(2.0);
+  const [useAuto, setUseAuto] = useState(false);
+
+  const isBetting = gameState.status === "betting";
+  const isActive = gameState.status === "active";
+
+  const activeBets = myBets.filter((b) => b.bet.status === "active");
+  const wonBets = myBets.filter((b) => b.bet.status === "won");
+  const lostBets = myBets.filter((b) => b.bet.status === "lost");
+
+  const hasActiveBet = activeBets.length > 0;
+  const canBet = (isBetting || isActive) && !hasActiveBet;
+  const canCashout = isActive && hasActiveBet;
+
+  const currentWin = useMemo(
+    () =>
+      activeBets.reduce(
+        (total, pb) =>
+          total +
+          Math.floor(pb.bet.winAmount ?? pb.bet.amount * gameState.multiplier),
+        0,
+      ),
+    [activeBets, gameState.multiplier],
+  );
+
+  const adjustAmount = (delta: number) => {
+    setAmountInput((prev) => Math.max(MIN_BET, prev + delta * step));
+  };
+
+  const handlePlaceBet = async () => {
+    if (placing) return;
+    setPlacingSlots((prev) => ({ ...prev, [index]: true }));
+
+    const amount = Math.floor(amountInput);
+    if (amount < MIN_BET || amount > balance) {
+      toast({
+        title: "Invalid Bet",
+        description:
+          amount < MIN_BET
+            ? `Minimum bet is ${MIN_BET}`
+            : "Bet exceeds your balance",
+        variant: "destructive",
+      });
+      setPlacingSlots((prev) => ({ ...prev, [index]: false }));
+      return;
+    }
+
+    let autoCashout: number | null = null;
+    if (useAuto) {
+      if (autoInput < 1.01) {
+        toast({
+          title: "Invalid AutoCashout",
+          description: "Minimum autoCashout is 1.01x",
+          variant: "destructive",
+        });
+        setPlacingSlots((prev) => ({ ...prev, [index]: false }));
+        return;
+      }
+      autoCashout = autoInput;
+    }
+
+    try {
+      await onPlaceBet(amount, autoCashout, index);
+      toast({
+        title: "Bet Placed",
+        description: `Slot ${index + 1} bet placed successfully`,
+        variant: "default",
+      });
+    } catch (err: any) {
+      toast({
+        title: "Bet Failed",
+        description: err?.message ?? "Slot already taken",
+        variant: "destructive",
+      });
+    } finally {
+      setPlacingSlots((prev) => ({ ...prev, [index]: false }));
+    }
+  };
+
+  const handleCashout = async () => {
+    if (cashing || activeBets.length === 0) return;
+    setCashingSlots((prev) => ({ ...prev, [index]: true }));
+
+    try {
+      await onCashout(index);
+      confetti({
+        particleCount: 80,
+        spread: 60,
+        origin: { y: 0.6 },
+        colors: ["#00ff66", "#fff"],
+      });
+      toast({
+        title: "Cashout Successful",
+        description: `You cashed out ${formatMoney(currentWin)}`,
+        variant: "default",
+      });
+    } catch (err: any) {
+      toast({
+        title: "Cashout Failed",
+        description: err?.message ?? "Something went wrong",
+        variant: "destructive",
+      });
+    } finally {
+      setCashingSlots((prev) => ({ ...prev, [index]: false }));
+    }
+  };
+
+  return (
+    <div className="bg-card rounded-xl p-4 border border-border shadow-lg flex flex-col gap-3 relative overflow-hidden">
+      <div className="absolute top-2 right-2 text-[10px] font-bold text-muted-foreground uppercase opacity-30">
+        Slot {index + 1}
+      </div>
+
+      {/* Step selection */}
+      <div className="flex gap-1 justify-center mb-1">
+        {[10, 100, 1000].map((s) => (
+          <button
+            key={s}
+            onClick={() => setStep(s)}
+            className={`w-10 h-7 rounded-md text-white ${
+              step === s ? "bg-primary" : "bg-black"
+            } text-[12px]`}
+          >
+            {s}
+          </button>
+        ))}
+      </div>
+
+      {/* Amount input */}
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => adjustAmount(-1)}
+          disabled={placing}
+          className="w-8 h-8 rounded-full bg-black text-white flex items-center justify-center"
+        >
+          -
+        </button>
+        <Input
+          type="number"
+          value={amountInput}
+          onChange={(e) =>
+            setAmountInput(
+              Math.max(MIN_BET, Math.floor(Number(e.target.value))),
+            )
+          }
+          disabled={placing}
+          className="h-10 text-center font-mono flex-1"
+        />
+        <button
+          onClick={() => adjustAmount(1)}
+          disabled={placing}
+          className="w-8 h-8 rounded-full bg-black text-white flex items-center justify-center"
+        >
+          +
+        </button>
+      </div>
+
+      {/* AutoCashout */}
+      <div className="space-y-1 mt-2">
+        <div className="flex items-center justify-between">
+          <Label className="text-[10px] font-bold uppercase text-muted-foreground">
+            Auto
+          </Label>
+          <input
+            type="checkbox"
+            checked={useAuto}
+            onChange={(e) => setUseAuto(e.target.checked)}
+            disabled={placing}
+            className="w-3 h-3 accent-primary"
+          />
+        </div>
+        <Input
+          type="number"
+          value={autoInput}
+          onChange={(e) => setAutoInput(Math.max(1.01, Number(e.target.value)))}
+          disabled={!useAuto || placing}
+          min={1.01}
+          step={0.01}
+          className="h-8 bg-background border-border text-sm font-mono"
+        />
+      </div>
+
+      {/* Active bets */}
+      {activeBets.length > 0 && (
+        <div className="space-y-1 mt-2 text-xs font-mono">
+          {activeBets.map((pb) => (
+            <div key={pb.bet.id}>
+              {formatMoney(pb.bet.amount)} @ {pb.bet.autoCashout ?? "manual"}x
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Actions */}
+      <div className="h-12 mt-auto">
+        {canBet ? (
+          <Button
+            onClick={handlePlaceBet}
+            disabled={placing}
+            className={`w-full h-full text-xs font-bold uppercase tracking-wider ${
+              placing
+                ? "bg-gray-500 cursor-not-allowed"
+                : "bg-primary hover:bg-primary/90"
+            }`}
+          >
+            {placing ? "Placing..." : "Bet"}
+          </Button>
+        ) : canCashout ? (
+          <Button
+            onClick={handleCashout}
+            disabled={cashing}
+            className="w-full h-full text-xs font-bold uppercase bg-yellow-400 hover:bg-yellow-500 text-white flex flex-col items-center justify-center"
+          >
+            <span>Cash Out</span>
+            <span className="font-mono">{formatMoney(currentWin)}</span>
+          </Button>
+        ) : wonBets.length > 0 ? (
+          <div className="w-full h-full bg-green-500/20 border border-green-500/50 text-green-500 rounded-md flex flex-col items-center justify-center font-bold">
+            <span className="text-[10px] uppercase">Won</span>
+            <span className="font-mono text-sm">
+              {formatMoney(
+                wonBets.reduce((sum, b) => sum + (b.bet.winAmount ?? 0), 0),
+              )}
+            </span>
+          </div>
+        ) : lostBets.length > 0 ? (
+          <div className="w-full h-full bg-destructive/10 border border-destructive/30 text-destructive rounded-md flex items-center justify-center font-bold text-xs uppercase">
+            Crashed
+          </div>
+        ) : (
+          <Button
+            disabled
+            className="w-full h-full text-[10px] font-bold uppercase bg-secondary opacity-50"
+          >
+            Waiting...
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
