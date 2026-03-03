@@ -27,69 +27,74 @@ export function useGame() {
   const { user } = useAuth();
   const wsRef = useRef<WebSocket | null>(null);
 
-  const MIN_BET = 10;
-  const SLOTS_QUERY_KEY = ["slots"];
-
   const [gameState, setGameState] = useState<GameState>({
     status: "betting",
     multiplier: 1.0,
     elapsed: 0,
   });
 
-  const [activeBets, setActiveBets] = useState<PlayerBet[]>([]);
+  const [visibleBets, setVisibleBets] = useState<PlayerBet[]>([]);
 
-  // ---------------------------
-  // Fetch initial game state
-  // ---------------------------
+  // ─────────────────────────────────────────────
+  // Initial Game State
+  // ─────────────────────────────────────────────
   useQuery({
     queryKey: ["gameState"],
     queryFn: async () => {
-      const res = await fetch(api.game.state.path);
-      if (!res.ok) return null;
+      const res = await fetch(api.game.state.path, {
+        credentials: "include",
+      });
+      if (!res.ok) throw new Error("Failed to fetch initial game state");
       const data = await res.json();
       setGameState((prev) => ({ ...prev, ...data }));
       return data;
     },
     refetchOnWindowFocus: false,
+    retry: 1,
   });
 
-  // ---------------------------
-  // Fetch user slots
-  // ---------------------------
+  // ─────────────────────────────────────────────
+  // Slots / Balances
+  // ─────────────────────────────────────────────
   const { data: slots = [] } = useQuery({
-    queryKey: SLOTS_QUERY_KEY,
+    queryKey: ["slots"],
     queryFn: async () => {
       if (!user) return [];
-      const res = await fetch("/api/slots", { credentials: "include" });
-      if (!res.ok) return [];
+      const res = await fetch("/api/slots", {
+        credentials: "include",
+      });
+      if (!res.ok) throw new Error("Failed to fetch slots");
       return await res.json();
     },
-    refetchInterval: 5000,
+    refetchInterval: 4000,
+    staleTime: 3000,
   });
 
-  const slotBalances = useMemo(() => {
+  const slotBalances = useMemo<Record<number, number>>(() => {
     const balances: Record<number, number> = {};
-    slots.forEach((slot: any, index: number) => {
-      balances[index] = slot.balance ?? 0;
+    slots.forEach((slot: any, i: number) => {
+      balances[i] = slot.balance ?? 0;
     });
     return balances;
   }, [slots]);
 
-  // ---------------------------
-  // Fetch game history
-  // ---------------------------
+  // ─────────────────────────────────────────────
+  // History
+  // ─────────────────────────────────────────────
   const { data: history = [] } = useQuery({
     queryKey: ["gameHistory"],
     queryFn: async () => {
-      const res = await fetch(api.game.history.path);
+      const res = await fetch(api.game.history.path, {
+        credentials: "include",
+      });
       if (!res.ok) return [];
       return await res.json();
     },
   });
 
-  // ---------------------------
-  // WebSocket connection
-  // ---------------------------
+  // ─────────────────────────────────────────────
+  // WebSocket
+  // ─────────────────────────────────────────────
   useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -98,6 +103,8 @@ export function useGame() {
     const connect = () => {
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
+
+      ws.onopen = () => console.log("WebSocket connected");
 
       ws.onmessage = (event) => {
         try {
@@ -115,7 +122,9 @@ export function useGame() {
                 elapsed: 0,
                 roundId: payload.roundId,
               });
-              setActiveBets([]);
+              setVisibleBets((prev) =>
+                prev.filter((b) => b.bet.status !== "active"),
+              );
               break;
 
             case wsEvents.SERVER_ROUND_CRASH:
@@ -125,46 +134,73 @@ export function useGame() {
                 multiplier: payload.crashPoint,
                 crashPoint: payload.crashPoint,
               }));
-              queryClient.invalidateQueries({ queryKey: ["gameHistory"] });
-              setActiveBets((prev) =>
+
+              queryClient.invalidateQueries({
+                queryKey: ["gameHistory"],
+              });
+
+              setVisibleBets((prev) =>
                 prev.map((pb) =>
                   pb.bet.status === "active"
                     ? { ...pb, bet: { ...pb.bet, status: "lost" } }
                     : pb,
                 ),
               );
+
+              setTimeout(() => {
+                setVisibleBets((prev) =>
+                  prev.filter((b) => b.bet.status !== "lost"),
+                );
+              }, 8000);
               break;
 
             case wsEvents.SERVER_BET_PLACED:
-              setActiveBets((prev) => {
-                // Replace existing bet for same slot
+              setVisibleBets((prev) => {
                 const filtered = prev.filter(
-                  (b) => b.playerIndex !== payload.playerIndex,
+                  (b) => b.playerIndex !== payload.bet?.playerIndex,
                 );
                 return [...filtered, payload].sort(
-                  (a, b) => b.bet.amount - a.bet.amount,
+                  (a, b) => (b.bet.amount ?? 0) - (a.bet.amount ?? 0),
                 );
               });
               break;
 
             case wsEvents.SERVER_BET_CASHED_OUT:
-              setActiveBets((prev) =>
-                prev.map((pb) => (pb.bet.id === payload.bet.id ? payload : pb)),
-              );
+              setVisibleBets((prev) => {
+                const updated = prev.map((pb) =>
+                  pb.bet.id === payload.bet.id
+                    ? {
+                        ...pb,
+                        bet: { ...pb.bet, ...payload.bet, status: "won" },
+                      }
+                    : pb,
+                );
+
+                return updated.filter((b) => {
+                  if (b.bet.status === "lost") return false;
+                  if (b.bet.status === "won") {
+                    return Date.now() - (b.bet.createdAt ?? 0) < 8000;
+                  }
+                  return true;
+                });
+              });
               break;
 
             case wsEvents.SERVER_BALANCE_UPDATE:
-              queryClient.setQueryData(SLOTS_QUERY_KEY, payload.slots);
+              queryClient.setQueryData(["slots"], payload.slots);
               break;
           }
         } catch (err) {
-          console.error("WS parse error:", err);
+          console.error("WS message parse error:", err);
         }
       };
 
       ws.onclose = () => {
-        reconnectTimeout = setTimeout(connect, 3000);
+        const delay = reconnectTimeout ? 5000 : 2000;
+        reconnectTimeout = setTimeout(connect, delay);
       };
+
+      ws.onerror = (err) => console.error("WebSocket error:", err);
     };
 
     connect();
@@ -175,47 +211,58 @@ export function useGame() {
     };
   }, [queryClient]);
 
-  // ---------------------------
-  // Place Bet
-  // ---------------------------
+  // ─────────────────────────────────────────────
   const placeBetMutation = useMutation({
     mutationFn: async ({
       amount,
       autoCashout,
       playerIndex,
+      queueForNext = false,
     }: {
-      amount: number | string;
-      autoCashout?: number | string | null;
-      playerIndex?: number;
+      amount: number;
+      autoCashout?: number | null;
+      playerIndex: number;
+      queueForNext?: boolean;
     }) => {
-      if (playerIndex === undefined) throw new Error("playerIndex required");
-      let parsedAmount = Number(amount);
-      if (isNaN(parsedAmount)) parsedAmount = MIN_BET;
-      parsedAmount = Math.max(MIN_BET, Math.floor(parsedAmount));
-
-      let parsedAuto: number | null = null;
-      if (autoCashout) {
-        const tmp = Number(autoCashout);
-        if (!isNaN(tmp) && tmp >= 1.01) parsedAuto = tmp;
-      }
+      // Use latest values of gameState only for logging, not for logic
+      console.log("[PLACE BET REQUEST]", {
+        gameStatus: gameState.status,
+        queueForNext,
+        slot: playerIndex,
+        amount,
+      });
 
       const res = await fetch(api.bets.place.path, {
-        method: api.bets.place.method,
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          amount: parsedAmount,
-          autoCashout: parsedAuto,
-          playerIndex,
-        }),
         credentials: "include",
+        body: JSON.stringify({
+          amount,
+          autoCashout: autoCashout ?? null,
+          playerIndex,
+          saveNextBet: queueForNext,
+        }),
       });
 
       if (!res.ok) {
-        const err = await res.json();
+        // Attempt to parse JSON error, fallback to generic
+        const err = await res.json().catch(() => ({}));
         throw new Error(err.message || "Failed to place bet");
       }
 
-      return await res.json();
+      const data = await res.json();
+
+      // Optionally update cache immediately
+      queryClient.setQueryData(["slots"], (old: any) => {
+        if (!old) return old;
+        return old.map((slot: any, idx: number) =>
+          idx === playerIndex
+            ? { ...slot, balance: (slot.balance ?? 0) - amount }
+            : slot,
+        );
+      });
+
+      return data;
     },
     onError: (err: Error) => {
       toast({
@@ -224,26 +271,31 @@ export function useGame() {
         variant: "destructive",
       });
     },
+    onSuccess: (bet) => {
+      // Invalidate relevant queries to refresh UI
+      queryClient.invalidateQueries(["gameHistory"]);
+      queryClient.invalidateQueries(["slots"]);
+    },
   });
 
-  // ---------------------------
-  // Cashout
-  // ---------------------------
+  // ─────────────────────────────────────────────
+  // CASHOUT
+  // ─────────────────────────────────────────────
   const cashoutMutation = useMutation({
     mutationFn: async (playerIndex: number) => {
       const res = await fetch(api.bets.cashout.path, {
-        method: api.bets.cashout.method,
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ playerIndex }),
         credentials: "include",
+        body: JSON.stringify({ playerIndex }),
       });
 
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.message || "Failed to cash out");
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.message || "Cashout failed");
       }
 
-      return await res.json();
+      return res.json();
     },
     onError: (err: Error) => {
       toast({
@@ -254,17 +306,14 @@ export function useGame() {
     },
   });
 
-  // ---------------------------
-  // Derived data
-  // ---------------------------
   const myBets = useMemo(
-    () => (user ? activeBets.filter((pb) => pb.user.id === user.id) : []),
-    [activeBets, user],
+    () => (user ? visibleBets.filter((pb) => pb.user.id === user.id) : []),
+    [visibleBets, user],
   );
 
   return {
     gameState,
-    activeBets,
+    activeBets: visibleBets,
     myBets,
     history,
     slotBalances,

@@ -22,17 +22,13 @@ export class GameEngine {
   private crashPoint = 1.0;
   private multiplier = 1.0;
   private startTime = 0;
-
   private growthRate = 0.06;
   private gameLoop: NodeJS.Timeout | null = null;
   private stateBroadcastInterval: NodeJS.Timeout | null = null;
   private bettingTimeout: NodeJS.Timeout | null = null;
-
   private serverSeed = "";
   private clientSeed = "00000000000000000000000000000000"; // Default daily hash
   private nonce = 0;
-
-  // Store "Bet Next" per user & slot
   private nextBets: Record<number, Record<number, NextBet>> = {};
 
   constructor(server: Server) {
@@ -41,9 +37,9 @@ export class GameEngine {
     this.startNewRound();
   }
 
-  // ---------------------------
-  // WebSocket & heartbeat
-  // ---------------------------
+  // ────────────────────────────────────────────────
+  // WebSocket & Heartbeat
+  // ────────────────────────────────────────────────
   private setupWebSocket() {
     this.wss.on("connection", (ws: Client) => {
       ws.isAlive = true;
@@ -52,14 +48,16 @@ export class GameEngine {
       ws.on("message", (message: string) => {
         try {
           const data = JSON.parse(message.toString());
-          if (data.type === "auth" && data.userId) {
+          if (data.type === "auth" && typeof data.userId === "number") {
             ws.userId = data.userId;
             ws.username = data.username;
           }
-        } catch {}
+        } catch (err) {
+          console.warn("Invalid WS message:", err);
+        }
       });
 
-      // Send initial state
+      // Send current game state immediately to new client
       ws.send(
         JSON.stringify({
           type: wsEvents.SERVER_STATE_UPDATE,
@@ -68,40 +66,48 @@ export class GameEngine {
       );
     });
 
-    const interval = setInterval(() => {
+    // Heartbeat: ping clients every 30s, terminate if no pong
+    const heartbeatInterval = setInterval(() => {
       this.wss.clients.forEach((ws) => {
         const client = ws as Client;
-        if (!client.isAlive) return client.terminate();
+        if (!client.isAlive) {
+          client.terminate();
+          return;
+        }
         client.isAlive = false;
         client.ping();
       });
     }, 30000);
 
-    this.wss.on("close", () => clearInterval(interval));
+    this.wss.on("close", () => clearInterval(heartbeatInterval));
   }
 
-  // ---------------------------
-  // Broadcast helpers
-  // ---------------------------
+  // ────────────────────────────────────────────────
+  // Broadcast Helpers
+  // ────────────────────────────────────────────────
   private broadcast(type: string, payload: any) {
-    const msg = JSON.stringify({ type, payload });
+    const message = JSON.stringify({ type, payload });
     this.wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) client.send(msg);
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(message);
+      }
     });
   }
 
   private sendToUser(userId: number, type: string, payload: any) {
-    const msg = JSON.stringify({ type, payload });
+    const message = JSON.stringify({ type, payload });
     this.wss.clients.forEach((client) => {
       const c = client as Client;
-      if (c.readyState === WebSocket.OPEN && c.userId === userId) c.send(msg);
+      if (c.readyState === WebSocket.OPEN && c.userId === userId) {
+        c.send(message);
+      }
     });
   }
 
-  // ---------------------------
-  // Crash calculation
-  // ---------------------------
-  private generateCrashPoint() {
+  // ────────────────────────────────────────────────
+  // Provably Fair Crash Point Generation
+  // ────────────────────────────────────────────────
+  private generateCrashPoint(): number {
     this.serverSeed = crypto.randomBytes(32).toString("hex");
     this.nonce++;
 
@@ -116,13 +122,12 @@ export class GameEngine {
     return Math.max(1.0, Math.floor(90 / (1 - result)) / 100);
   }
 
-  // ---------------------------
-  // Round lifecycle
-  // ---------------------------
-  private async startNewRound() {
+  // ────────────────────────────────────────────────
+  // Round Lifecycle
+  // ────────────────────────────────────────────────
+  private async startNewRound(): Promise<void> {
     try {
       this.clearTimers();
-
       this.status = "betting";
       this.multiplier = 1.0;
       this.crashPoint = this.generateCrashPoint();
@@ -133,58 +138,70 @@ export class GameEngine {
         this.clientSeed,
         this.nonce,
       );
+
       this.currentRoundId = round.id;
 
+      // Combined round start + state update (reduces client race conditions)
       this.broadcast(wsEvents.SERVER_ROUND_START, {
         roundId: this.currentRoundId,
+        ...this.getStatus(),
       });
-      this.broadcastState();
 
-      // Betting phase 5s
+      // 5-second betting window
       this.bettingTimeout = setTimeout(() => this.startGame(), 5000);
-    } catch (e) {
-      console.error("Failed to start new round:", e);
+    } catch (error) {
+      console.error("Failed to start new round:", error);
       setTimeout(() => this.startNewRound(), 2000);
     }
   }
 
-  private async startGame() {
+  private async startGame(): Promise<void> {
     if (this.status !== "betting") return;
+
     this.status = "active";
     this.startTime = Date.now();
 
-    if (this.currentRoundId)
+    if (this.currentRoundId) {
       await storage.updateRoundStatus(this.currentRoundId, "active");
+    }
 
-    // Game tick
+    this.broadcast(wsEvents.SERVER_STATE_UPDATE, this.getStatus());
+
     this.gameLoop = setInterval(() => this.tick(), 50);
     this.stateBroadcastInterval = setInterval(() => this.broadcastState(), 100);
 
-    // Auto-place "Bet Next" bets
+    // Auto-place queued bets for this round
     for (const userIdStr in this.nextBets) {
       const userId = Number(userIdStr);
       for (const slotStr in this.nextBets[userId]) {
         const slot = Number(slotStr);
-        const bet = this.nextBets[userId][slot];
-        this.placeBet(userId, slot, bet.amount, bet.autoCashout, false);
+        const queued = this.nextBets[userId][slot];
+        this.placeBet(
+          userId,
+          slot,
+          queued.amount,
+          queued.autoCashout,
+          false,
+        ).catch((err) => console.warn("Auto-place queued bet failed:", err));
       }
     }
+
     this.nextBets = {};
   }
 
-  private clearTimers() {
-    if (this.gameLoop) clearInterval(this.gameLoop);
-    if (this.stateBroadcastInterval) clearInterval(this.stateBroadcastInterval);
-    if (this.bettingTimeout) clearTimeout(this.bettingTimeout);
+  private clearTimers(): void {
+    [this.gameLoop, this.stateBroadcastInterval, this.bettingTimeout].forEach(
+      (timer) => timer && clearInterval(timer),
+    );
     this.gameLoop = null;
     this.stateBroadcastInterval = null;
     this.bettingTimeout = null;
   }
 
-  // ---------------------------
-  // Tick logic (multiplier & auto cashout)
-  // ---------------------------
-  private async tick() {
+  // ────────────────────────────────────────────────
+  // Game Tick (multiplier growth + auto-cashout)
+  // ────────────────────────────────────────────────
+  private async tick(): Promise<void> {
     if (this.status !== "active") return;
 
     const elapsed = Date.now() - this.startTime;
@@ -197,7 +214,9 @@ export class GameEngine {
     }
 
     if (!this.currentRoundId) return;
+
     const activeBets = await storage.getActiveBets(this.currentRoundId);
+
     await Promise.all(
       activeBets.map(async (bet) => {
         if (
@@ -210,16 +229,16 @@ export class GameEngine {
             bet.userId,
             bet.autoCashout,
             bet.playerIndex,
-          );
+          ).catch((err) => console.warn("Auto-cashout failed:", err));
         }
       }),
     );
   }
 
-  // ---------------------------
-  // Crash
-  // ---------------------------
-  private async crash() {
+  // ────────────────────────────────────────────────
+  // Crash Round
+  // ────────────────────────────────────────────────
+  private async crash(): Promise<void> {
     this.status = "crashed";
     this.clearTimers();
 
@@ -229,7 +248,9 @@ export class GameEngine {
         "crashed",
         new Date(),
       );
+
       const activeBets = await storage.getActiveBets(this.currentRoundId);
+
       await Promise.all(
         activeBets
           .filter((b) => b.status === "active")
@@ -239,15 +260,19 @@ export class GameEngine {
 
     this.broadcast(wsEvents.SERVER_ROUND_CRASH, {
       crashPoint: this.crashPoint,
+      multiplier: this.multiplier,
+      timestamp: Date.now(),
     });
+
     this.broadcastState();
 
+    // Short delay before new round
     setTimeout(() => this.startNewRound(), 3000);
   }
 
-  // ---------------------------
-  // Place Bet
-  // ---------------------------
+  // ────────────────────────────────────────────────
+  // Place Bet (immediate or queued)
+  // ────────────────────────────────────────────────
   public async placeBet(
     userId: number,
     playerIndex: number,
@@ -255,15 +280,31 @@ export class GameEngine {
     autoCashout?: number | null,
     saveNextBet: boolean = false,
   ) {
-    if (this.status !== "betting" && !saveNextBet)
-      throw new Error("Cannot bet now");
-    if (!this.currentRoundId) throw new Error("No active round");
+    if (!this.currentRoundId) {
+      throw new Error("No active round available");
+    }
+
+    // Allow queuing anytime; immediate bets only during betting phase
+    if (!saveNextBet && this.status !== "betting") {
+      throw new Error(
+        "Cannot place immediate bet now — please queue for the next round",
+      );
+    }
 
     const userSlots = await storage.getUserSlots(userId);
-    if ((userSlots[playerIndex]?.balance ?? 0) < amount)
-      throw new Error("Insufficient balance");
+    const slot = userSlots[playerIndex];
 
-    const newBalance = (userSlots[playerIndex]?.balance ?? 0) - amount;
+    if (!slot) {
+      throw new Error(`Slot ${playerIndex + 1} not found for user ${userId}`);
+    }
+
+    const slotBalance = slot.balance ?? 0;
+
+    if (slotBalance < amount) {
+      throw new Error("Insufficient balance");
+    }
+
+    const newBalance = slotBalance - amount;
     await storage.updateSlotBalance(userId, playerIndex, newBalance);
 
     const bet = await storage.placeBet(
@@ -274,33 +315,52 @@ export class GameEngine {
       autoCashout,
     );
 
+    // Notify user of balance change
     this.sendToUser(userId, wsEvents.SERVER_BALANCE_UPDATE, {
       slots: await storage.getUserSlots(userId),
     });
+
+    // Broadcast bet placement to everyone
     this.broadcast(wsEvents.SERVER_BET_PLACED, {
-      ...bet,
+      bet: {
+        id: bet.id,
+        roundId: this.currentRoundId,
+        userId: bet.userId,
+        playerIndex,
+        amount: bet.amount,
+        autoCashout: bet.autoCashout ?? null,
+        status: bet.status,
+        createdAt: bet.createdAt ?? Date.now(),
+      },
       user: { id: userId },
-      playerIndex,
     });
 
+    // Queue for next round if requested
     if (saveNextBet) {
-      if (!this.nextBets[userId]) this.nextBets[userId] = {};
+      if (!this.nextBets[userId]) {
+        this.nextBets[userId] = {};
+      }
       this.nextBets[userId][playerIndex] = { amount, autoCashout };
     }
 
     return bet;
   }
 
-  // ---------------------------
-  // Cashout
-  // ---------------------------
+  // ────────────────────────────────────────────────
+  // Cashout Bet
+  // ────────────────────────────────────────────────
   public async handleCashout(
     userId: number,
     cashoutValue?: number,
     playerIndex: number = 0,
-  ) {
-    if (this.status !== "active") throw new Error("Round is not active");
-    if (!this.currentRoundId) throw new Error("No active round");
+  ): Promise<number> {
+    if (this.status !== "active") {
+      throw new Error("Round is not active");
+    }
+
+    if (!this.currentRoundId) {
+      throw new Error("No active round");
+    }
 
     const activeBets = await storage.getActiveBets(this.currentRoundId);
     const bet = activeBets.find(
@@ -309,13 +369,25 @@ export class GameEngine {
         b.status === "active" &&
         b.playerIndex === playerIndex,
     );
-    if (!bet) throw new Error("No active bet for this slot");
 
-    const cashoutMul = cashoutValue || this.multiplier;
-    if (cashoutMul > this.crashPoint) throw new Error("Already crashed");
+    if (!bet) {
+      throw new Error("No active bet found for this slot");
+    }
 
-    const winAmount = Math.floor(bet.amount * cashoutMul);
-    await storage.updateBetStatus(bet.id, "won", cashoutMul, winAmount);
+    const cashoutMultiplier = cashoutValue ?? this.multiplier;
+
+    // Prevent late/invalid cashouts
+    if (cashoutMultiplier > this.crashPoint + 0.001) {
+      console.warn(
+        `Rejected late cashout - user:${userId} slot:${playerIndex} ` +
+          `req:${cashoutMultiplier.toFixed(3)} crash:${this.crashPoint.toFixed(3)}`,
+      );
+      throw new Error("Cashout value exceeds crash point");
+    }
+
+    const winAmount = Math.floor(bet.amount * cashoutMultiplier);
+
+    await storage.updateBetStatus(bet.id, "won", cashoutMultiplier, winAmount);
 
     const slot = await storage.getSlot(userId, playerIndex);
     if (slot) {
@@ -324,24 +396,37 @@ export class GameEngine {
         playerIndex,
         slot.balance + winAmount,
       );
-      const allSlots = await storage.getUserSlots(userId);
+
       this.sendToUser(userId, wsEvents.SERVER_BALANCE_UPDATE, {
-        slots: allSlots,
+        slots: await storage.getUserSlots(userId),
       });
     }
 
+    // Broadcast cashout event
     this.broadcast(wsEvents.SERVER_BET_CASHED_OUT, {
-      bet: { ...bet, status: "won", cashoutMultiplier: cashoutMul, winAmount },
+      bet: {
+        id: bet.id,
+        roundId: this.currentRoundId,
+        userId: bet.userId,
+        playerIndex: bet.playerIndex,
+        amount: bet.amount,
+        autoCashout: bet.autoCashout ?? null,
+        status: "won",
+        cashoutMultiplier,
+        winAmount,
+        createdAt: bet.createdAt ?? Date.now(),
+      },
       user: { id: userId },
+      timestamp: Date.now(),
     });
 
     return winAmount;
   }
 
-  // ---------------------------
-  // State helpers
-  // ---------------------------
-  private broadcastState() {
+  // ────────────────────────────────────────────────
+  // State Helpers
+  // ────────────────────────────────────────────────
+  private broadcastState(): void {
     this.broadcast(wsEvents.SERVER_STATE_UPDATE, this.getStatus());
   }
 

@@ -1,6 +1,32 @@
-node_modules
-dist
+# dependencies
+node_modules/
+
+# build output
+dist/
+release/
+release.zip/
+*.zip
+
+# logs
+*.log
+npm-debug.log*
+
+# environment
+.env
+.env.*
+
+# database
+db.sqlite
+*.sqlite
+
+# OS
 .DS_Store
-server/public
-vite.config.ts.*
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+
+# misc
 *.tar.gz
+server/public
