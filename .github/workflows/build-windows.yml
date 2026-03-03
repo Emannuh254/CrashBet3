@@ -29,9 +29,9 @@ jobs:
       - name: Build frontend (Vite)
         run: npm run build:frontend
 
-      # Step 5: Build Electron app for Windows x64
+      # Step 5: Build Electron app for Windows x64 (skip publishing/signing)
       - name: Build Electron app (Windows x64)
-        run: npx electron-builder --win --x64
+        run: npx electron-builder --win --x64 --publish never
 
       # Step 6: Upload release folder as artifact
       - name: Upload Windows build artifact
